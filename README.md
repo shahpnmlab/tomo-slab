@@ -15,6 +15,9 @@ uv tool install git+https://github.com/shahpnmlab/tomo-slab
 tomo-slab --version
 ```
 
+To update to the latest version, run `uv tool upgrade tomo-slab` (re-running `uv tool install` does
+nothing once the tool is installed; add `--reinstall` if an upgrade does not take effect).
+
 **With pip** — pip does not know where to find the library, so give both as git URLs:
 
 ```bash
