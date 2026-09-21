@@ -11,6 +11,8 @@ from __future__ import annotations
 import gc
 import logging
 import multiprocessing
+import queue
+import threading
 import traceback
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
@@ -22,16 +24,41 @@ from typing import Any, Callable, Optional
 LOG_FORMAT = "%(asctime)s - %(processName)s - %(levelname)s - %(message)s"
 
 
-def configure_logging(verbose: bool) -> None:
-    """Set up root logging.
+def configure_logging(verbose: bool, log_file: Optional[Path] = None) -> None:
+    """Set up root logging: to the console, or to ``log_file`` only if one is given.
 
-    The library calls ``logging.basicConfig`` at import time, which is a no-op once the root
-    logger has a handler, so this must run before the library is imported (in the CLI callback
-    and in every worker).
+    With a log file the console stays quiet (the CLI draws progress bars there) and Python
+    warnings are routed into the log as well. The library calls ``logging.basicConfig`` at
+    import time, which is a no-op once the root logger has a handler, so this must run before
+    the library is imported (in the CLI and in every worker).
     """
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO, format=LOG_FORMAT, force=True
-    )
+    level = logging.DEBUG if verbose else logging.INFO
+    if log_file is None:
+        logging.basicConfig(level=level, format=LOG_FORMAT, force=True)
+        return
+    # Every process appends to the same file; one short line per write keeps them intact.
+    handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.basicConfig(level=level, handlers=[handler], force=True)
+    logging.captureWarnings(False)  # captureWarnings(True) is a no-op if already on; reset first
+    logging.captureWarnings(True)
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Progress of one tomogram, sent from a worker to whoever draws the progress bars.
+
+    ``kind`` is ``"start"``, ``"update"`` or ``"finish"``. ``total`` is None while the current
+    ``phase`` has no measurable progress.
+    """
+
+    kind: str
+    index: int
+    name: str
+    device: str
+    phase: str = ""
+    completed: int = 0
+    total: Optional[int] = None
 
 
 # --------------------------------------------------------------------------- devices
@@ -139,8 +166,65 @@ def _release_memory(device: str) -> None:
             torch.cuda.empty_cache()
 
 
+# Which tomogram this process is working on, and where to report progress (or None).
+_CURRENT: dict[str, Any] = {}
+
+
+def _emit(kind: str, phase: str = "", completed: int = 0, total: Optional[int] = None) -> None:
+    report = _CURRENT.get("report")
+    if report is not None:
+        report(
+            ProgressEvent(
+                kind, _CURRENT["index"], _CURRENT["name"], _CURRENT["device"],
+                phase, completed, total,
+            )
+        )
+
+
+class _ProgressTqdm:
+    """Stand-in for ``tqdm`` inside the library's predict module.
+
+    The library draws a tqdm bar over the slices of each axis. Several workers doing that at
+    once garble the terminal, so the loop reports to ``_emit`` instead of drawing anything.
+    """
+
+    def __init__(self, iterable, desc="", total=None, **_ignored):
+        self.iterable, self.desc = iterable, desc
+        self.total = total if total is not None else len(iterable)
+
+    def __iter__(self):
+        step = max(1, self.total // 200)  # ~200 events per loop is plenty
+        _emit("update", self.desc, 0, self.total)
+        for n, item in enumerate(self.iterable, 1):
+            yield item
+            if n % step == 0 or n == self.total:
+                _emit("update", self.desc, n, self.total)
+
+
+def _install_progress_shim() -> Optional[Any]:
+    """Swap the library's tqdm for ``_ProgressTqdm``; returns the original to restore."""
+    from torch_segment_tomogram_boundaries import predict
+
+    original = getattr(predict, "tqdm", None)
+    if original is not None:
+        predict.tqdm = _ProgressTqdm
+    return original
+
+
+def _restore_progress(original: Optional[Any]) -> None:
+    if original is not None:
+        from torch_segment_tomogram_boundaries import predict
+
+        predict.tqdm = original
+
+
 def _process_tomogram(
-    index: int, tomogram: Path, opts: PredictOptions, predictor: Any, device: str
+    index: int,
+    tomogram: Path,
+    opts: PredictOptions,
+    predictor: Any,
+    device: str,
+    report: Optional[Callable[[ProgressEvent], None]] = None,
 ) -> TomogramResult:
     """Predict -> threshold -> write mask -> (fit planes once) -> write outputs -> thickness.
 
@@ -149,6 +233,8 @@ def _process_tomogram(
     """
     result = TomogramResult(index=index, path=tomogram, device=str(device))
     written: list[Path] = []
+    _CURRENT.update(report=report, index=index, name=tomogram.name, device=str(device))
+    _emit("start", "loading")
     try:
         import mrcfile
         import numpy as np
@@ -159,6 +245,7 @@ def _process_tomogram(
         )
 
         paths = output_paths(tomogram, opts)
+        logging.info("%s: predicting on %s", tomogram.name, device)
         probs = predictor.predict_probabilities(
             tomogram,
             slab_size=opts.slab_size,
@@ -175,18 +262,21 @@ def _process_tomogram(
             )
             written.append(paths[key])
 
+        _emit("update", "writing mask")
         write("mask", binary)
         result.mask_path = paths["mask"]
 
         # Fit the top/bottom planes once; reuse them for the fitted mask and thickness.
         planes = None
         if opts.fit_planes or opts.measure_thickness:
+            _emit("update", "fitting planes")
             try:
                 planes = fit_slab_planes(
                     binary.astype(np.uint8), opts.downsample_grid_size, device=device
                 )
             except (ValueError, RuntimeError) as e:
                 result.warnings.append(f"plane fitting failed ({e})")
+                logging.warning("%s: plane fitting failed (%s)", tomogram.name, e)
         if opts.measure_thickness:
             result.thickness_row = {
                 "name": tomogram.name,
@@ -199,6 +289,7 @@ def _process_tomogram(
     except Exception as e:  # noqa: BLE001 - one bad tomogram must not stop the others
         result.error = f"{type(e).__name__}: {e}"
         result.traceback = traceback.format_exc()
+        logging.error("%s failed:\n%s", tomogram.name, result.traceback)
         result.thickness_row = None
         for p in written:
             p.unlink(missing_ok=True)
@@ -206,6 +297,8 @@ def _process_tomogram(
     finally:
         # Also frees GPU memory held by a failed (e.g. out-of-memory) attempt.
         _release_memory(device)
+        _emit("finish")
+        _CURRENT.clear()
     return result
 
 
@@ -227,20 +320,26 @@ def _build_predictor(
 
 def _init_worker(
     device_queue: Any,
+    progress_queue: Any,
     checkpoint: Path,
     compile_model: bool,
     verbose: bool,
+    log_file: Optional[Path],
     worker_setup: Optional[Callable[[], None]],
 ) -> None:
     """Claim one device and build this worker's predictor (once, reused for every tomogram)."""
-    configure_logging(verbose)
+    configure_logging(verbose, log_file)
     device = device_queue.get(timeout=60)
     _WORKER["device"] = device
     try:
         _WORKER["predictor"] = _build_predictor(checkpoint, compile_model, device, worker_setup)
+        if progress_queue is not None:
+            _WORKER["report"] = progress_queue.put
+            _install_progress_shim()
     except Exception as e:  # noqa: BLE001
         # Raising here would break the whole pool with an uninformative error; keep it and
         # report it against every tomogram this worker is handed.
+        logging.error("worker on %s failed to start:\n%s", device, traceback.format_exc())
         _WORKER["init_error"] = (f"{type(e).__name__}: {e}", traceback.format_exc())
 
 
@@ -252,7 +351,26 @@ def _worker_task(index: int, tomogram: Path, opts: PredictOptions) -> TomogramRe
             index=index, path=tomogram, device=device,
             error=f"worker failed to start on {device}: {error}", traceback=tb,
         )
-    return _process_tomogram(index, tomogram, opts, _WORKER["predictor"], device)
+    return _process_tomogram(
+        index, tomogram, opts, _WORKER["predictor"], device, _WORKER.get("report")
+    )
+
+
+def _drain(
+    events: Any, on_progress: Callable[[ProgressEvent], None], stop: threading.Event
+) -> None:
+    """Forward events from the workers' queue to ``on_progress`` until told to stop."""
+    while True:
+        try:
+            event = events.get(timeout=0.1)
+        except queue.Empty:
+            if stop.is_set():
+                return
+            continue
+        try:
+            on_progress(event)
+        except Exception:  # noqa: BLE001 - a broken progress display must not stop the run
+            logging.exception("progress callback failed")
 
 
 # --------------------------------------------------------------------------- public entry point
@@ -266,6 +384,8 @@ def run_predictions(
     checkpoint: Path,
     compile_model: bool = False,
     verbose: bool = False,
+    log_file: Optional[Path] = None,
+    on_progress: Optional[Callable[[ProgressEvent], None]] = None,
     worker_setup: Optional[Callable[[], None]] = None,
 ) -> Iterator[TomogramResult]:
     """Predict every tomogram in ``tasks`` and yield one result per tomogram as it completes.
@@ -275,6 +395,11 @@ def run_predictions(
     is used, because CUDA cannot be used in forked children. Idle workers pull the next
     tomogram, so uneven tomogram sizes balance automatically. Failures are reported in the
     yielded results rather than raised.
+
+    ``log_file`` is the file the workers log to (see `configure_logging`; the caller sets up
+    logging in this process). If ``on_progress`` is given it is called with `ProgressEvent`s
+    as work advances, and the library's own tqdm bars are silenced. It is called from a
+    background thread when there are several workers.
 
     ``worker_setup`` is an optional top-level (picklable) callable run in each worker before the
     predictor is built; it exists mainly for tests.
@@ -287,20 +412,35 @@ def run_predictions(
     if n_workers == 1:
         device = slots[0]
         predictor = _build_predictor(checkpoint, compile_model, device, worker_setup)
-        for index, tomogram in enumerate(tasks):
-            yield _process_tomogram(index, tomogram, opts, predictor, device)
+        original_tqdm = _install_progress_shim() if on_progress is not None else None
+        try:
+            for index, tomogram in enumerate(tasks):
+                yield _process_tomogram(index, tomogram, opts, predictor, device, on_progress)
+        finally:
+            _restore_progress(original_tqdm)
         return
 
     ctx = multiprocessing.get_context("spawn")
     device_queue = ctx.Queue()
     for device in slots[:n_workers]:
         device_queue.put(device)
+    progress_queue = ctx.Queue() if on_progress is not None else None
+    stop = threading.Event()
+    drain_thread = None
+    if progress_queue is not None:
+        drain_thread = threading.Thread(
+            target=_drain, args=(progress_queue, on_progress, stop), daemon=True
+        )
+        drain_thread.start()
 
     executor = ProcessPoolExecutor(
         max_workers=n_workers,
         mp_context=ctx,
         initializer=_init_worker,
-        initargs=(device_queue, checkpoint, compile_model, verbose, worker_setup),
+        initargs=(
+            device_queue, progress_queue, checkpoint, compile_model, verbose, log_file,
+            worker_setup,
+        ),
     )
     futures: dict[Future, tuple[int, Path]] = {}
     try:
@@ -322,4 +462,8 @@ def run_predictions(
                 )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        # Workers have exited, so every event is already in the pipe; let the thread drain it.
+        stop.set()
+        if drain_thread is not None:
+            drain_thread.join(timeout=5)
         device_queue.close()

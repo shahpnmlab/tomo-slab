@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tomo-slab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Command-line tool for segmenting slab boundaries in cryo-ET tomograms (wraps torch-tomo-slab), with multi-GPU job distribution."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "torch-tomo-slab",
     "typer",
+    "rich",
 ]
 
 [project.scripts]

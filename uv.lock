@@ -5812,9 +5812,10 @@ wheels = [
 
 [[package]]
 name = "tomo-slab"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "rich" },
     { name = "torch-tomo-slab" },
     { name = "typer", version = "0.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "typer", version = "0.27.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
@@ -5829,6 +5830,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "rich" },
     { name = "torch-tomo-slab", git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries?tag=v0.1.0" },
     { name = "typer" },
 ]

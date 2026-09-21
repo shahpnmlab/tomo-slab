@@ -61,9 +61,11 @@ def test_pool_with_real_tiny_checkpoint_and_a_corrupt_tomogram(
     out = tmp_path / "out"
     out.mkdir()
     opts = PredictOptions(output_dir=out, slab_size=3, batch_size=4, save_probabilities=True)
+    events = []
     results = list(
         run_predictions(
-            tasks, ["cpu", "cpu"], 1, opts, tiny_checkpoint, worker_setup=apply_tiny_settings
+            tasks, ["cpu", "cpu"], 1, opts, tiny_checkpoint,
+            on_progress=events.append, worker_setup=apply_tiny_settings,
         )
     )
 
@@ -80,6 +82,16 @@ def test_pool_with_real_tiny_checkpoint_and_a_corrupt_tomogram(
             assert float(m.voxel_size.x) == pytest.approx(10.0)
     # nothing is left behind for the failed tomogram
     assert not list(out.glob("corrupt*"))
+
+    # Progress: every tomogram starts and finishes, and the library's per-slice tqdm loop is
+    # reported as measurable progress (this is what the shim is for).
+    for t in [*tomos, corrupt]:
+        mine = [e for e in events if e.name == t.name]
+        assert mine[0].kind == "start" and mine[-1].kind == "finish", mine
+    for t in tomos:
+        bars = [e for e in events if e.name == t.name and e.total]
+        assert {e.phase for e in bars} == {"Slab Blending (XZ axis)", "Slab Blending (YZ axis)"}
+        assert max(e.completed for e in bars) == max(e.total for e in bars)
 
 
 def test_single_worker_runs_in_process(tmp_path, tiny_checkpoint, make_tomogram):
@@ -188,3 +200,70 @@ def test_cli_overwrite_skips_existing_outputs(tmp_path, make_tomogram, fake_pred
     )
     assert again.exit_code == 0
     assert "Skipping t.mrc" in again.output
+
+
+# ------------------------------------------------------------------ logging and progress display
+
+
+def test_predict_logs_to_file_and_keeps_the_console_quiet(
+    tmp_path, make_tomogram, fake_predictor
+):
+    shape = (96, 128, 128)
+    tomos = [make_tomogram(f"t{i}.mrc", shape=shape) for i in range(2)]
+    for devices in ("cpu", "cpu,cpu"):  # in-process, then worker processes
+        result, out, _ = _run_cli(tmp_path, tomos, devices)
+        assert result.exit_code == 0, result.output
+        log = (out / "tomo-slab.log").read_text()
+        for t in tomos:
+            assert f"fake predict {t.name}" in log
+            assert f"fake warning for {t.name}" in log  # Python warnings end up in the log too
+        assert "INFO" not in result.output
+        assert "fake predict" not in result.output
+        assert "fake warning" not in result.output
+        assert "logging to" in result.output
+
+
+def test_predict_log_file_option(tmp_path, make_tomogram, fake_predictor):
+    tomo = make_tomogram("t.mrc", shape=(96, 128, 128))
+    log = tmp_path / "custom" / "my.log"
+    result, out, _ = _run_cli(tmp_path, [tomo], "cpu", "--log-file", str(log))
+    assert result.exit_code == 0, result.output
+    assert "fake predict t.mrc" in log.read_text()
+    assert not (out / "tomo-slab.log").exists()
+
+
+def test_run_predictions_reports_progress_from_workers(tmp_path, make_tomogram, fake_predictor):
+    from tomo_slab.runner import ProgressEvent
+
+    tomos = [make_tomogram(f"t{i}.mrc", shape=(96, 128, 128)) for i in range(3)]
+    opts = PredictOptions(output_dir=tmp_path, fit_planes=True)
+    events = []
+    results = list(
+        run_predictions(
+            tomos, ["cpu", "cpu"], 1, opts, tmp_path / "unused.ckpt",
+            on_progress=events.append, worker_setup=use_fake_predictor,
+        )
+    )
+    assert all(r.ok for r in results)
+    assert all(isinstance(e, ProgressEvent) for e in events)
+    for t in tomos:
+        phases = [e.phase for e in events if e.name == t.name]
+        assert phases[0] == "loading"
+        assert "fitting planes" in phases
+
+
+def test_progress_view_tracks_rows_and_ignores_late_events():
+    from tomo_slab.progress import ProgressView
+    from tomo_slab.runner import ProgressEvent
+
+    with ProgressView(2) as view:
+        view.handle(ProgressEvent("start", 0, "a.mrc", "cuda:0", "loading"))
+        view.handle(ProgressEvent("update", 0, "a.mrc", "cuda:0", "Slab Blending (XZ axis)", 5, 10))
+        view.handle(ProgressEvent("start", 1, "b [x].mrc", "cuda:1", "loading"))  # markup-ish name
+        assert set(view._rows) == {0, 1}
+        view.handle(ProgressEvent("finish", 0, "a.mrc", "cuda:0"))
+        view.complete(0)
+        view.handle(ProgressEvent("update", 0, "a.mrc", "cuda:0", "late", 9, 10))
+        assert set(view._rows) == {1}
+        view.complete(1)
+        assert view._done == 2

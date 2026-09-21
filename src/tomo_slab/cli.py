@@ -5,6 +5,8 @@ so that ``--help`` and ``--version`` stay fast.
 """
 from __future__ import annotations
 
+import logging
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -208,14 +210,21 @@ def predict(
         help="Worker processes per device. Each worker holds its own copy of the model and "
         "full-volume tensors, so tune this to the available VRAM and tomogram size.",
     ),
+    log_file: Optional[Path] = typer.Option(
+        None, "--log-file", dir_okay=False,
+        help="Where to write log messages (from all workers), which are kept off the console. "
+        "Default: <output-dir>/tomo-slab.log.",
+    ),
 ) -> None:
     """Predict slab masks for one or more tomograms, optionally fitting planes and measuring thickness.
 
     One tomogram is one unit of work, and there are one worker process per device per --jobs-per-device (a single worker runs in-process). A tomogram that fails is reported and skipped; the exit code is non-zero if any failed.
     """  # noqa: E501
+    from tomo_slab.progress import ProgressView
     from tomo_slab.runner import (
         PredictOptions,
         assign_devices,
+        configure_logging,
         default_devices,
         output_paths,
         parse_devices,
@@ -268,41 +277,50 @@ def predict(
     if not todo:
         return
 
+    # Log messages go to a file so that they do not garble the progress bars.
+    verbose = bool(ctx.meta.get("tomo_slab.verbose", False))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_file or output_dir / "tomo-slab.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    configure_logging(verbose, log_file)
+    logging.info("tomo-slab %s: %s", __version__, " ".join(sys.argv))
+
     if checkpoint is None:  # download once here, not in every worker
         from torch_segment_tomogram_boundaries.fetch import get_latest_checkpoint
 
         checkpoint = get_latest_checkpoint()
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     n_workers = min(len(assign_devices(device_list, jobs_per_device)), len(todo))
     typer.echo(
         f"Predicting {len(todo)} tomogram(s) with {n_workers} worker(s) on "
-        f"{','.join(dict.fromkeys(device_list))}"
+        f"{','.join(dict.fromkeys(device_list))}; logging to {log_file}"
     )
 
-    verbose = bool(ctx.meta.get("tomo_slab.verbose", False))
     thickness_rows: list[tuple[int, dict]] = []
     failed: list[Path] = []
-    for result in run_predictions(
-        todo, device_list, jobs_per_device, opts, checkpoint,
-        compile_model=compile_model, verbose=verbose,
-    ):
-        for w in result.warnings:
-            typer.secho(f"{result.path.name}: {w}", fg=typer.colors.YELLOW, err=True)
-        if result.ok:
-            typer.secho(
-                f"{result.path.name} -> {result.mask_path} [{result.device}]",
-                fg=typer.colors.GREEN,
-            )
-            if result.thickness_row is not None:
-                thickness_rows.append((result.index, result.thickness_row))
-        else:
-            failed.append(result.path)
-            typer.secho(
-                f"FAILED {result.path.name}: {result.error}", fg=typer.colors.RED, err=True
-            )
-            if verbose and result.traceback:
-                typer.echo(result.traceback, err=True)
+    with ProgressView(len(todo)) as view:
+        for result in run_predictions(
+            todo, device_list, jobs_per_device, opts, checkpoint,
+            compile_model=compile_model, verbose=verbose, log_file=log_file,
+            on_progress=view.handle,
+        ):
+            view.complete(result.index)
+            for w in result.warnings:
+                typer.secho(f"{result.path.name}: {w}", fg=typer.colors.YELLOW, err=True)
+            if result.ok:
+                typer.secho(
+                    f"{result.path.name} -> {result.mask_path} [{result.device}]",
+                    fg=typer.colors.GREEN,
+                )
+                if result.thickness_row is not None:
+                    thickness_rows.append((result.index, result.thickness_row))
+            else:
+                failed.append(result.path)
+                typer.secho(
+                    f"FAILED {result.path.name}: {result.error}", fg=typer.colors.RED, err=True
+                )
+                if verbose and result.traceback:
+                    typer.echo(result.traceback, err=True)
 
     if thickness_file is not None:
         # Completion order is arbitrary; report in input order.

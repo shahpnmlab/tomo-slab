@@ -28,6 +28,9 @@ def apply_tiny_settings():
 
 def use_fake_predictor():
     """Replace the model by a synthetic slab; tomograms named ``bad*`` raise."""
+    import logging
+    import warnings
+
     import mrcfile
     from torch_segment_tomogram_boundaries import predict
 
@@ -37,6 +40,8 @@ def use_fake_predictor():
     def predict_probabilities(self, tomo, **kwargs):
         if tomo.name.startswith("bad"):
             raise RuntimeError(f"simulated failure on {tomo.name}")
+        logging.info("fake predict %s", tomo.name)
+        warnings.warn(f"fake warning for {tomo.name}", stacklevel=2)
         with mrcfile.open(tomo, permissive=True, header_only=True) as mrc:
             shape = (int(mrc.header.nz), int(mrc.header.ny), int(mrc.header.nx))
         return tilted_slab(shape, thickness=20.0, slope=0.3)

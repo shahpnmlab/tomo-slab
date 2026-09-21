@@ -6,7 +6,7 @@ library, plus multi-GPU job distribution for `predict`.
 
 ## Installation
 
-`tomo-slab` and the `torch-segment-tomogram-boundaries` library it wraps are not on PyPI yet, so install from GitHub.
+`tomo-slab` and the `torch-tomo-slab` library it wraps (repository `torch-segment-tomogram-boundaries`) are not on PyPI yet, so install from GitHub.
 
 **With [uv](https://docs.astral.sh/uv/) (recommended)** — installs `tomo-slab` as an isolated tool:
 
@@ -20,7 +20,7 @@ tomo-slab --version
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install \
-  "torch-segment-tomogram-boundaries @ git+https://github.com/teamtomo/torch-segment-tomogram-boundaries@v0.1.0" \
+  "torch-tomo-slab @ git+https://github.com/teamtomo/torch-segment-tomogram-boundaries@v0.1.0" \
   "tomo-slab @ git+https://github.com/shahpnmlab/tomo-slab"
 ```
 
@@ -53,6 +53,10 @@ Every worker holds its own copy of the model and the full-volume tensors, so GPU
 with `--jobs-per-device`. Tune it to your VRAM and tomogram size.
 
 With one device and `--jobs-per-device 1` everything runs in-process (no worker pool).
+
+While running, `predict` shows one progress row per tomogram being processed. Log messages
+(model loading, warnings, failures with tracebacks) are kept off the console and written to
+`<output-dir>/tomo-slab.log`, or to the file given with `--log-file`; `-v` adds debug output.
 
 ## Development
 
