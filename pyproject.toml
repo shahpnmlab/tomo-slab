@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tomo-slab"
+version = "0.1.0"
+description = "Command-line tool for segmenting slab boundaries in cryo-ET tomograms (wraps torch-tomo-slab), with multi-GPU job distribution."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Pranav NM Shah", email = "p.shah.lab@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "torch-tomo-slab",
+    "typer",
+]
+
+[project.scripts]
+tomo-slab = "tomo_slab.cli:app"
+
+[project.urls]
+repository = "https://github.com/shahpnmlab/tomo-slab"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.uv.sources]
+torch-tomo-slab = { git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries", tag = "v0.1.0" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tomo_slab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = [
+    "B008",  # typer.Option()/Argument() defaults are the intended API
+    "UP045",  # typer evaluates annotations at runtime, so keep Optional[...] for Python 3.9
+]
+
+[tool.pytest.ini_options]
+addopts = ["-ra"]
+testpaths = ["tests"]
+# Lets spawned worker processes import the tiny-model helper in tests/.
+pythonpath = ["tests"]
