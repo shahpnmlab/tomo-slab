@@ -4,6 +4,31 @@ Command-line tool for segmenting the top/bottom boundaries of a slab (e.g. a lam
 tomograms. It is a thin wrapper over the [`torch-tomo-slab`](https://github.com/teamtomo/torch-segment-tomogram-boundaries)
 library, plus multi-GPU job distribution for `predict`.
 
+## Installation
+
+`tomo-slab` and the `torch-tomo-slab` library it wraps are not on PyPI yet, so install from GitHub.
+
+**With [uv](https://docs.astral.sh/uv/) (recommended)** — installs `tomo-slab` as an isolated tool:
+
+```bash
+uv tool install git+https://github.com/shahpnmlab/tomo-slab
+tomo-slab --version
+```
+
+**With pip** — pip does not know where to find the library, so give both as git URLs:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install \
+  "torch-tomo-slab @ git+https://github.com/teamtomo/torch-segment-tomogram-boundaries@v0.1.0" \
+  "tomo-slab @ git+https://github.com/shahpnmlab/tomo-slab"
+```
+
+Multi-GPU prediction needs a CUDA build of PyTorch that matches your driver; see
+[pytorch.org](https://pytorch.org/get-started/locally/) if `torch.cuda.is_available()` is false.
+
+## Usage
+
 ```bash
 tomo-slab fetch                                   # download the pretrained checkpoint
 tomo-slab predict *.mrc -o out --fit-planes --thickness-file thickness.csv
