@@ -1,12 +1,12 @@
 # tomo-slab
 
 Command-line tool for segmenting the top/bottom boundaries of a slab (e.g. a lamella) in cryo-ET
-tomograms. It is a thin wrapper over the [`torch-tomo-slab`](https://github.com/teamtomo/torch-segment-tomogram-boundaries)
+tomograms. It is a thin wrapper over the [`torch-segment-tomogram-boundaries`](https://github.com/teamtomo/torch-segment-tomogram-boundaries)
 library, plus multi-GPU job distribution for `predict`.
 
 ## Installation
 
-`tomo-slab` and the `torch-tomo-slab` library it wraps are not on PyPI yet, so install from GitHub.
+`tomo-slab` and the `torch-segment-tomogram-boundaries` library it wraps are not on PyPI yet, so install from GitHub.
 
 **With [uv](https://docs.astral.sh/uv/) (recommended)** — installs `tomo-slab` as an isolated tool:
 
@@ -20,7 +20,7 @@ tomo-slab --version
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install \
-  "torch-tomo-slab @ git+https://github.com/teamtomo/torch-segment-tomogram-boundaries@v0.1.0" \
+  "torch-segment-tomogram-boundaries @ git+https://github.com/teamtomo/torch-segment-tomogram-boundaries@v0.1.0" \
   "tomo-slab @ git+https://github.com/shahpnmlab/tomo-slab"
 ```
 
