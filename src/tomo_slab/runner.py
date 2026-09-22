@@ -174,6 +174,31 @@ def _release_memory(device: str) -> None:
             torch.cuda.empty_cache()
 
 
+def _reset_gpu_peaks(device: str) -> None:
+    if str(device).startswith("cuda"):
+        import torch
+
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _log_gpu_peaks(name: str, device: str) -> None:
+    """Log this process's peak GPU memory for the tomogram just processed.
+
+    ``allocated`` is memory held by live tensors; ``reserved`` is what the caching allocator
+    took from the driver (what nvidia-smi shows), which can be higher, notably with several
+    CUDA streams because each keeps its own cache of free blocks.
+    """
+    if str(device).startswith("cuda"):
+        import torch
+
+        gib = 1024**3
+        logging.info(
+            "%s: peak GPU memory on %s: %.2f GiB allocated, %.2f GiB reserved",
+            name, device, torch.cuda.max_memory_allocated(device) / gib,
+            torch.cuda.max_memory_reserved(device) / gib,
+        )
+
+
 # Which tomogram this process is working on, and where to report progress (or None).
 _CURRENT: dict[str, Any] = {}
 
@@ -356,6 +381,7 @@ def _process_tomogram(
         report=report, index=index, name=tomogram.name, device=str(device), slot=slot
     )
     _LOOPS.clear()
+    _reset_gpu_peaks(device)
     _emit("start", "loading")
     try:
         import mrcfile
@@ -415,6 +441,7 @@ def _process_tomogram(
             p.unlink(missing_ok=True)
         result.mask_path = None
     finally:
+        _log_gpu_peaks(tomogram.name, device)
         # Also frees GPU memory held by a failed (e.g. out-of-memory) attempt.
         _release_memory(device)
         _emit("finish")
