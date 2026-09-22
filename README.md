@@ -6,7 +6,7 @@ library, plus multi-GPU job distribution for `predict`.
 
 ## Installation
 
-`tomo-slab` and the `torch-segment-tomogram-boundaries` library it wraps (repository `torch-segment-tomogram-boundaries`) are not on PyPI yet, so install from GitHub.
+`tomo-slab` and the `torch-segment-tomogram-boundaries` library it wraps are not on PyPI yet, so install from GitHub.
 
 **With [uv](https://docs.astral.sh/uv/) (recommended)** — installs `tomo-slab` as an isolated tool:
 
