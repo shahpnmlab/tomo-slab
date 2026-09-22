@@ -57,7 +57,20 @@ with `--jobs-per-device`. Tune it to your VRAM and tomogram size.
 
 With one device and `--jobs-per-device 1` everything runs in-process (no worker pool).
 
-While running, `predict` shows one progress row per tomogram being processed. Log messages
+### `--parallel-axes`
+
+Each tomogram is segmented in two passes (XZ and YZ slices) that normally run one after the other.
+With `--parallel-axes` the tomogram is loaded once and both passes run at the same time, each on its
+own CUDA stream, which helps when a single pass leaves the GPU partly idle. It needs extra VRAM for
+the second pass's activations, so it is off by default and only worth trying on a large-memory GPU.
+It works with CUDA devices only and cannot be combined with `--compile`. It is independent of
+`--jobs-per-device`: with both, every worker runs its two passes concurrently. Whether it is
+faster depends on your GPU, tomogram size and `--batch-size`, so time it on one of your tomograms.
+
+While running, `predict` shows one progress bar per worker (`len(devices) * jobs-per-device` in
+total, or fewer if there are fewer tomograms). When a worker finishes a tomogram its bar moves on to
+the next one, so the display never grows; each finished tomogram is printed above the bars as
+`[done/total]`. Log messages
 (model loading, warnings, failures with tracebacks) are kept off the console and written to
 `<output-dir>/tomo-slab.log`, or to the file given with `--log-file`; `-v` adds debug output.
 

@@ -210,6 +210,13 @@ def predict(
         help="Worker processes per device. Each worker holds its own copy of the model and "
         "full-volume tensors, so tune this to the available VRAM and tomogram size.",
     ),
+    parallel_axes: bool = typer.Option(
+        False, "--parallel-axes",
+        help="Run the XZ and YZ passes of each tomogram at the same time (on separate CUDA "
+        "streams), loading the tomogram once. Faster when one pass leaves the GPU partly idle, "
+        "but needs more VRAM for the second pass's activations, so it is off by default. "
+        "CUDA only; not compatible with --compile.",
+    ),
     log_file: Optional[Path] = typer.Option(
         None, "--log-file", dir_okay=False,
         help="Where to write log messages (from all workers), which are kept off the console. "
@@ -223,13 +230,13 @@ def predict(
     from tomo_slab.progress import ProgressView
     from tomo_slab.runner import (
         PredictOptions,
-        assign_devices,
         configure_logging,
         default_devices,
         output_paths,
         parse_devices,
         run_predictions,
         validate_devices,
+        worker_devices,
     )
 
     if slab_size % 2 == 0:
@@ -240,6 +247,15 @@ def predict(
         validate_devices(device_list)
     except ValueError as e:
         raise typer.BadParameter(str(e), param_hint="--devices") from e
+
+    if parallel_axes:
+        if compile_model:
+            raise typer.BadParameter(
+                "the model is shared by both passes, which CUDA graphs cannot do",
+                param_hint="--parallel-axes/--compile",
+            )
+        if not all(d.startswith("cuda") for d in device_list):
+            raise typer.BadParameter("needs CUDA devices only", param_hint="--parallel-axes")
 
     stems: dict[str, Path] = {}
     for tomo in tomograms:
@@ -261,6 +277,7 @@ def predict(
         fit_planes=fit_planes_mask,
         downsample_grid_size=downsample_grid_size,
         measure_thickness=thickness_file is not None,
+        parallel_axes=parallel_axes,
     )
 
     # Honour --overwrite in the parent, before anything is submitted.
@@ -290,37 +307,42 @@ def predict(
 
         checkpoint = get_latest_checkpoint()
 
-    n_workers = min(len(assign_devices(device_list, jobs_per_device)), len(todo))
+    slots = worker_devices(device_list, jobs_per_device, len(todo))
     typer.echo(
-        f"Predicting {len(todo)} tomogram(s) with {n_workers} worker(s) on "
+        f"Predicting {len(todo)} tomogram(s) with {len(slots)} worker(s) on "
         f"{','.join(dict.fromkeys(device_list))}; logging to {log_file}"
     )
 
     thickness_rows: list[tuple[int, dict]] = []
     failed: list[Path] = []
-    with ProgressView(len(todo)) as view:
-        for result in run_predictions(
-            todo, device_list, jobs_per_device, opts, checkpoint,
-            compile_model=compile_model, verbose=verbose, log_file=log_file,
-            on_progress=view.handle,
+    with ProgressView(slots, [t.name for t in todo]) as view:
+        for n_done, result in enumerate(
+            run_predictions(
+                todo, device_list, jobs_per_device, opts, checkpoint,
+                compile_model=compile_model, verbose=verbose, log_file=log_file,
+                on_progress=view.handle,
+            ),
+            1,
         ):
             view.complete(result.index)
             for w in result.warnings:
-                typer.secho(f"{result.path.name}: {w}", fg=typer.colors.YELLOW, err=True)
+                view.print(f"{result.path.name}: {w}", style="yellow", err=True)
             if result.ok:
-                typer.secho(
-                    f"{result.path.name} -> {result.mask_path} [{result.device}]",
-                    fg=typer.colors.GREEN,
+                view.print(
+                    f"[{n_done}/{len(todo)}] {result.path.name} -> {result.mask_path} "
+                    f"[{result.device}]",
+                    style="green",
                 )
                 if result.thickness_row is not None:
                     thickness_rows.append((result.index, result.thickness_row))
             else:
                 failed.append(result.path)
-                typer.secho(
-                    f"FAILED {result.path.name}: {result.error}", fg=typer.colors.RED, err=True
+                view.print(
+                    f"[{n_done}/{len(todo)}] FAILED {result.path.name}: {result.error}",
+                    style="red", err=True,
                 )
                 if verbose and result.traceback:
-                    typer.echo(result.traceback, err=True)
+                    view.print(result.traceback, err=True)
 
     if thickness_file is not None:
         # Completion order is arbitrary; report in input order.

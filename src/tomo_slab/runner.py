@@ -15,7 +15,7 @@ import queue
 import threading
 import traceback
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,8 +48,9 @@ def configure_logging(verbose: bool, log_file: Optional[Path] = None) -> None:
 class ProgressEvent:
     """Progress of one tomogram, sent from a worker to whoever draws the progress bars.
 
-    ``kind`` is ``"start"``, ``"update"`` or ``"finish"``. ``total`` is None while the current
-    ``phase`` has no measurable progress.
+    ``kind`` is ``"start"``, ``"update"`` or ``"finish"``. ``slot`` numbers the worker, which
+    is what owns a progress bar. ``total`` is None while the current ``phase`` has no
+    measurable progress.
     """
 
     kind: str
@@ -59,6 +60,7 @@ class ProgressEvent:
     phase: str = ""
     completed: int = 0
     total: Optional[int] = None
+    slot: int = 0
 
 
 # --------------------------------------------------------------------------- devices
@@ -107,6 +109,11 @@ def assign_devices(devices: Sequence[str], jobs_per_device: int) -> list[str]:
     return [d for _ in range(jobs_per_device) for d in devices]
 
 
+def worker_devices(devices: Sequence[str], jobs_per_device: int, n_tasks: int) -> list[str]:
+    """The device of each worker that will run: one per slot, but no more than tasks."""
+    return assign_devices(devices, jobs_per_device)[:n_tasks]
+
+
 # --------------------------------------------------------------------------- data classes
 
 
@@ -123,6 +130,7 @@ class PredictOptions:
     fit_planes: bool = False
     downsample_grid_size: int = 8
     measure_thickness: bool = False
+    parallel_axes: bool = False
 
 
 @dataclass
@@ -176,9 +184,15 @@ def _emit(kind: str, phase: str = "", completed: int = 0, total: Optional[int] =
         report(
             ProgressEvent(
                 kind, _CURRENT["index"], _CURRENT["name"], _CURRENT["device"],
-                phase, completed, total,
+                phase, completed, total, _CURRENT["slot"],
             )
         )
+
+
+# The library's tqdm loops running at the moment: id -> [completed, total, finished]. With
+# concurrent axes (see `_predict_axes_in_parallel`) there are two, reported as one bar.
+_LOOPS: dict[int, list] = {}
+_LOOPS_LOCK = threading.Lock()
 
 
 class _ProgressTqdm:
@@ -186,19 +200,38 @@ class _ProgressTqdm:
 
     The library draws a tqdm bar over the slices of each axis. Several workers doing that at
     once garble the terminal, so the loop reports to ``_emit`` instead of drawing anything.
+    Loops that run at the same time are combined into a single bar.
     """
 
     def __init__(self, iterable, desc="", total=None, **_ignored):
         self.iterable, self.desc = iterable, desc
         self.total = total if total is not None else len(iterable)
 
+    def _report(self, completed: int, finished: bool = False) -> None:
+        with _LOOPS_LOCK:
+            _LOOPS[id(self)] = [completed, self.total, finished]
+            if len(_LOOPS) == 1:
+                desc = self.desc
+            else:
+                desc = "Slab Blending (XZ+YZ)"
+            _emit(
+                "update", desc,
+                sum(loop[0] for loop in _LOOPS.values()),
+                sum(loop[1] for loop in _LOOPS.values()),
+            )
+            if all(loop[2] for loop in _LOOPS.values()):
+                _LOOPS.clear()  # start afresh with the next axis (or tomogram)
+
     def __iter__(self):
         step = max(1, self.total // 200)  # ~200 events per loop is plenty
-        _emit("update", self.desc, 0, self.total)
+        self._report(0, finished=self.total <= 0)
+        n = 0
         for n, item in enumerate(self.iterable, 1):
             yield item
-            if n % step == 0 or n == self.total:
-                _emit("update", self.desc, n, self.total)
+            if n % step == 0 or n >= self.total:
+                self._report(n, finished=n >= self.total)
+        if n < self.total:  # the iterable ended early
+            self._report(n, finished=True)
 
 
 def _install_progress_shim() -> Optional[Any]:
@@ -218,6 +251,91 @@ def _restore_progress(original: Optional[Any]) -> None:
         predict.tqdm = original
 
 
+def _predict_probabilities(
+    predictor: Any, tomogram: Path, slab_size: int, batch_size: int,
+    smoothing_sigma: Optional[float],
+) -> Any:
+    return predictor.predict_probabilities(
+        tomogram, slab_size=slab_size, batch_size=batch_size, smoothing_sigma=smoothing_sigma
+    )
+
+
+def _predict_axes_in_parallel(
+    predictor: Any, tomogram: Path, slab_size: int, batch_size: int,
+    smoothing_sigma: Optional[float],
+) -> Any:
+    """`TomoSlabPredictor.predict_probabilities`, but with the XZ and YZ passes run together.
+
+    The tomogram is loaded and uploaded once and both passes read it. Each pass runs in its own
+    thread and, on CUDA, on its own stream, so the GPU can overlap them; that pays off when one
+    pass alone leaves the GPU partly idle (small batches, launch-bound slices), at the price of
+    a second set of activations in VRAM. The model is shared, which is fine for eval-mode
+    inference, but not for ``torch.compile(mode="reduce-overhead")`` (CUDA graphs).
+
+    This mirrors the body of the library's method (it has no way to run the axes concurrently),
+    so keep the two in step.
+    """
+    import mrcfile
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from torch_segment_tomogram_boundaries.utils import threeD
+
+    device = predictor.device
+    on_cuda = device.type == "cuda"
+
+    with mrcfile.open(tomogram, permissive=True) as mrc:
+        data = mrc.data.astype(np.float32)
+    original_shape = data.shape
+    logging.info("Input tomogram shape: %s", original_shape)
+
+    with torch.no_grad():
+        volume = threeD.resize_and_pad_3d(
+            torch.from_numpy(data), target_shape=predictor.target_shape_3d, mode="image"
+        ).to(device)
+        del data
+        if on_cuda:
+            torch.cuda.synchronize(device)  # the side streams must see the uploaded volume
+
+        def run_axis(axis: str, view: Any) -> Any:
+            if not on_cuda:
+                return predictor._predict_single_axis_with_slab_blending(
+                    view, axis, slab_size, batch_size
+                )
+            stream = torch.cuda.Stream(device)
+            with torch.cuda.stream(stream):
+                out = predictor._predict_single_axis_with_slab_blending(
+                    view, axis, slab_size, batch_size
+                )
+            stream.synchronize()
+            return out
+
+        logging.info("Predicting along the XZ and YZ axes at the same time.")
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="axis") as pool:
+            xz = pool.submit(run_axis, "XZ", volume)
+            yz = pool.submit(run_axis, "YZ", volume.permute(0, 2, 1))
+            pred_xz, pred_yz = xz.result(), yz.result().permute(0, 2, 1)
+        if on_cuda:  # made on side streams, used from now on on the current one
+            for pred in (pred_xz, pred_yz):
+                pred.record_stream(torch.cuda.current_stream(device))
+
+        logging.info("Averaging predictions from both axes.")
+        prob_map = (pred_xz + pred_yz) / 2.0
+        del pred_xz, pred_yz, volume
+
+        if smoothing_sigma and smoothing_sigma > 0:
+            logging.info("Applying 3D Gaussian smoothing with sigma=%s...", smoothing_sigma)
+            prob_map = threeD.gpu_gaussian_blur_3d(prob_map, smoothing_sigma, device)
+
+        logging.info("Resizing prediction back to original shape %s...", original_shape)
+        return (
+            F.interpolate(prob_map[None, None], size=original_shape, mode="area")
+            .squeeze()
+            .cpu()
+            .numpy()
+        )
+
+
 def _process_tomogram(
     index: int,
     tomogram: Path,
@@ -225,6 +343,7 @@ def _process_tomogram(
     predictor: Any,
     device: str,
     report: Optional[Callable[[ProgressEvent], None]] = None,
+    slot: int = 0,
 ) -> TomogramResult:
     """Predict -> threshold -> write mask -> (fit planes once) -> write outputs -> thickness.
 
@@ -233,7 +352,10 @@ def _process_tomogram(
     """
     result = TomogramResult(index=index, path=tomogram, device=str(device))
     written: list[Path] = []
-    _CURRENT.update(report=report, index=index, name=tomogram.name, device=str(device))
+    _CURRENT.update(
+        report=report, index=index, name=tomogram.name, device=str(device), slot=slot
+    )
+    _LOOPS.clear()
     _emit("start", "loading")
     try:
         import mrcfile
@@ -246,11 +368,9 @@ def _process_tomogram(
 
         paths = output_paths(tomogram, opts)
         logging.info("%s: predicting on %s", tomogram.name, device)
-        probs = predictor.predict_probabilities(
-            tomogram,
-            slab_size=opts.slab_size,
-            batch_size=opts.batch_size,
-            smoothing_sigma=opts.smoothing_sigma,
+        predict = _predict_axes_in_parallel if opts.parallel_axes else _predict_probabilities
+        probs = predict(
+            predictor, tomogram, opts.slab_size, opts.batch_size, opts.smoothing_sigma
         )
         with mrcfile.open(tomogram, permissive=True, header_only=True) as src:
             voxel_size = src.voxel_size.copy()
@@ -327,10 +447,10 @@ def _init_worker(
     log_file: Optional[Path],
     worker_setup: Optional[Callable[[], None]],
 ) -> None:
-    """Claim one device and build this worker's predictor (once, reused for every tomogram)."""
+    """Claim a (slot, device) pair and build this worker's predictor (reused for each tomogram)."""
     configure_logging(verbose, log_file)
-    device = device_queue.get(timeout=60)
-    _WORKER["device"] = device
+    slot, device = device_queue.get(timeout=60)
+    _WORKER["slot"], _WORKER["device"] = slot, device
     try:
         _WORKER["predictor"] = _build_predictor(checkpoint, compile_model, device, worker_setup)
         if progress_queue is not None:
@@ -352,7 +472,8 @@ def _worker_task(index: int, tomogram: Path, opts: PredictOptions) -> TomogramRe
             error=f"worker failed to start on {device}: {error}", traceback=tb,
         )
     return _process_tomogram(
-        index, tomogram, opts, _WORKER["predictor"], device, _WORKER.get("report")
+        index, tomogram, opts, _WORKER["predictor"], device, _WORKER.get("report"),
+        _WORKER["slot"],
     )
 
 
@@ -390,11 +511,11 @@ def run_predictions(
 ) -> Iterator[TomogramResult]:
     """Predict every tomogram in ``tasks`` and yield one result per tomogram as it completes.
 
-    ``len(devices) * jobs_per_device`` workers are used (never more than there are tomograms),
-    each pinned to one device. A single worker runs in-process; otherwise a spawn process pool
-    is used, because CUDA cannot be used in forked children. Idle workers pull the next
-    tomogram, so uneven tomogram sizes balance automatically. Failures are reported in the
-    yielded results rather than raised.
+    ``len(devices) * jobs_per_device`` workers are used (never more than there are tomograms;
+    see `worker_devices`), each pinned to one device and numbered by `ProgressEvent.slot`. A
+    single worker runs in-process; otherwise a spawn process pool is used, because CUDA cannot
+    be used in forked children. Idle workers pull the next tomogram, so uneven tomogram sizes
+    balance automatically. Failures are reported in the yielded results rather than raised.
 
     ``log_file`` is the file the workers log to (see `configure_logging`; the caller sets up
     logging in this process). If ``on_progress`` is given it is called with `ProgressEvent`s
@@ -406,8 +527,8 @@ def run_predictions(
     """
     if not tasks:
         return
-    slots = assign_devices(devices, jobs_per_device)
-    n_workers = min(len(slots), len(tasks))
+    slots = worker_devices(devices, jobs_per_device, len(tasks))
+    n_workers = len(slots)
 
     if n_workers == 1:
         device = slots[0]
@@ -415,15 +536,17 @@ def run_predictions(
         original_tqdm = _install_progress_shim() if on_progress is not None else None
         try:
             for index, tomogram in enumerate(tasks):
-                yield _process_tomogram(index, tomogram, opts, predictor, device, on_progress)
+                yield _process_tomogram(
+                    index, tomogram, opts, predictor, device, on_progress, slot=0
+                )
         finally:
             _restore_progress(original_tqdm)
         return
 
     ctx = multiprocessing.get_context("spawn")
     device_queue = ctx.Queue()
-    for device in slots[:n_workers]:
-        device_queue.put(device)
+    for slot, device in enumerate(slots):
+        device_queue.put((slot, device))
     progress_queue = ctx.Queue() if on_progress is not None else None
     stop = threading.Event()
     drain_thread = None

@@ -252,18 +252,113 @@ def test_run_predictions_reports_progress_from_workers(tmp_path, make_tomogram, 
         assert "fitting planes" in phases
 
 
-def test_progress_view_tracks_rows_and_ignores_late_events():
+def test_events_carry_the_worker_slot(tmp_path, make_tomogram, fake_predictor):
+    tomos = [make_tomogram(f"t{i}.mrc", shape=(96, 128, 128)) for i in range(6)]
+    events = []
+    list(
+        run_predictions(
+            tomos, ["cpu"], 2, PredictOptions(output_dir=tmp_path), tmp_path / "unused.ckpt",
+            on_progress=events.append, worker_setup=use_fake_predictor,
+        )
+    )
+    assert {e.slot for e in events} == {0, 1}
+    for t in tomos:  # one tomogram is only ever handled by one worker
+        assert len({e.slot for e in events if e.name == t.name}) == 1
+
+
+def test_progress_view_has_one_bar_per_worker_and_reuses_it():
     from tomo_slab.progress import ProgressView
     from tomo_slab.runner import ProgressEvent
 
-    with ProgressView(2) as view:
-        view.handle(ProgressEvent("start", 0, "a.mrc", "cuda:0", "loading"))
+    def text(slot):
+        return view._progress.tasks[view._rows[slot]].description
+
+    with ProgressView(["cuda:0", "cuda:1"], ["a.mrc", "b [x].mrc", "c.mrc"]) as view:
+        assert len(view._progress.tasks) == 2
+        view.handle(ProgressEvent("start", 0, "a.mrc", "cuda:0", "loading", slot=0))
         view.handle(ProgressEvent("update", 0, "a.mrc", "cuda:0", "Slab Blending (XZ axis)", 5, 10))
-        view.handle(ProgressEvent("start", 1, "b [x].mrc", "cuda:1", "loading"))  # markup-ish name
-        assert set(view._rows) == {0, 1}
-        view.handle(ProgressEvent("finish", 0, "a.mrc", "cuda:0"))
+        view.handle(ProgressEvent("start", 1, "b [x].mrc", "cuda:1", "loading", slot=1))
+        assert "a.mrc" in text(0) and "b" in text(1)
+
+        # worker 0 finishes a.mrc: its bar goes idle ...
+        view.handle(ProgressEvent("finish", 0, "a.mrc", "cuda:0", slot=0))
         view.complete(0)
+        assert "idle" in text(0) and "a.mrc" not in text(0)
+        # ... a late event for it is ignored ...
         view.handle(ProgressEvent("update", 0, "a.mrc", "cuda:0", "late", 9, 10))
-        assert set(view._rows) == {1}
-        view.complete(1)
-        assert view._done == 2
+        assert "late" not in text(0)
+        # ... and the same bar is reused for the next tomogram.
+        view.handle(ProgressEvent("start", 2, "c.mrc", "cuda:0", "loading", slot=0))
+        view.handle(ProgressEvent("update", 2, "c.mrc", "cuda:0", "predicting", 5, 10, 0))
+        row = view._progress.tasks[view._rows[0]]
+        assert "c.mrc" in row.description and (row.completed, row.total) == (5, 10)
+        assert len(view._progress.tasks) == 2  # never more bars than workers
+
+        # complete() for a tomogram whose bar has moved on does not blank the newer one
+        view.complete(0)
+        assert "c.mrc" in text(0)
+
+
+@pytest.mark.parametrize("width", [60, 80, 120, 200])
+def test_progress_view_rows_fit_the_terminal(monkeypatch, width):
+    """Rich mis-erases a live display with wrapped lines, so every row must fit on one line."""
+    from rich.console import Console
+
+    from tomo_slab.progress import ProgressView
+    from tomo_slab.runner import ProgressEvent
+
+    monkeypatch.setenv("COLUMNS", str(width))
+    name = "a_really_long_tomogram_name_" * 5 + ".mrc"
+    view = ProgressView(["cuda:0", "cuda:1"], [name])
+    view.handle(ProgressEvent("start", 0, name, "cuda:0", "Slab Blending (XZ+YZ)", slot=0))
+    view.handle(ProgressEvent("update", 0, name, "cuda:0", "Slab Blending (XZ+YZ)", 5, 10))
+    console = Console(width=width, color_system=None)
+    with console.capture() as cap:
+        console.print(view._progress.get_renderable())
+    lines = cap.get().splitlines()
+    assert len(lines) == 2  # one line per worker
+    assert all(len(line) <= width for line in lines), lines
+
+
+# ------------------------------------------------------------------ concurrent XZ/YZ passes
+
+
+def test_parallel_axes_gives_the_same_probabilities_as_the_library(
+    tmp_path, tiny_checkpoint, make_tomogram
+):
+    from torch_segment_tomogram_boundaries.predict import TomoSlabPredictor
+
+    tomo = make_tomogram("t.mrc")
+    predictor = TomoSlabPredictor(tiny_checkpoint, compile_model=False, device="cpu")
+    serial = predictor.predict_probabilities(tomo, slab_size=3, batch_size=4)
+    parallel = runner._predict_axes_in_parallel(predictor, tomo, 3, 4, None)
+    np.testing.assert_allclose(parallel, serial, atol=1e-5)
+    smoothed = runner._predict_axes_in_parallel(predictor, tomo, 3, 4, 1.0)
+    assert smoothed.shape == serial.shape
+
+
+def test_parallel_axes_reports_one_combined_bar(tmp_path, tiny_checkpoint, make_tomogram):
+    tomo = make_tomogram("t.mrc")
+    events = []
+    opts = PredictOptions(output_dir=tmp_path, slab_size=3, batch_size=4, parallel_axes=True)
+    (result,) = run_predictions(
+        [tomo], ["cpu"], 1, opts, tiny_checkpoint, on_progress=events.append
+    )
+    assert result.ok, result.traceback
+    bars = [e for e in events if e.total]
+    # Two loops at once: the total is both of them and only ever counts up.
+    assert bars[-1].total == 64 + 64  # slices along each axis of the (16, 64, 64) target
+    assert bars[-1].completed == bars[-1].total
+    assert all(a.completed <= b.completed for a, b in zip(bars, bars[1:])), "went backwards"
+
+
+def test_parallel_axes_option_validation(make_tomogram):
+    from typer.testing import CliRunner
+
+    tomo = make_tomogram("t.mrc")
+    r = CliRunner().invoke(app, ["predict", str(tomo), "--parallel-axes", "--devices", "cpu"])
+    assert r.exit_code != 0 and "CUDA" in r.output
+    r = CliRunner().invoke(
+        app, ["predict", str(tomo), "--parallel-axes", "--compile", "--devices", "cpu"]
+    )
+    assert r.exit_code != 0 and "--compile" in r.output
