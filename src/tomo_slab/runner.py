@@ -15,7 +15,7 @@ import queue
 import threading
 import traceback
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -215,7 +215,8 @@ def _emit(kind: str, phase: str = "", completed: int = 0, total: Optional[int] =
 
 
 # The library's tqdm loops running at the moment: id -> [completed, total, finished]. With
-# concurrent axes (see `_predict_axes_in_parallel`) there are two, reported as one bar.
+# ``parallel_axes=True`` the library runs two of these loops in its own worker threads at
+# once (one per axis), reported here as one combined bar.
 _LOOPS: dict[int, list] = {}
 _LOOPS_LOCK = threading.Lock()
 
@@ -278,87 +279,12 @@ def _restore_progress(original: Optional[Any]) -> None:
 
 def _predict_probabilities(
     predictor: Any, tomogram: Path, slab_size: int, batch_size: int,
-    smoothing_sigma: Optional[float],
+    smoothing_sigma: Optional[float], parallel_axes: bool,
 ) -> Any:
     return predictor.predict_probabilities(
-        tomogram, slab_size=slab_size, batch_size=batch_size, smoothing_sigma=smoothing_sigma
+        tomogram, slab_size=slab_size, batch_size=batch_size, smoothing_sigma=smoothing_sigma,
+        parallel_axes=parallel_axes,
     )
-
-
-def _predict_axes_in_parallel(
-    predictor: Any, tomogram: Path, slab_size: int, batch_size: int,
-    smoothing_sigma: Optional[float],
-) -> Any:
-    """`TomoSlabPredictor.predict_probabilities`, but with the XZ and YZ passes run together.
-
-    The tomogram is loaded and uploaded once and both passes read it. Each pass runs in its own
-    thread and, on CUDA, on its own stream, so the GPU can overlap them; that pays off when one
-    pass alone leaves the GPU partly idle (small batches, launch-bound slices), at the price of
-    a second set of activations in VRAM. The model is shared, which is fine for eval-mode
-    inference, but not for ``torch.compile(mode="reduce-overhead")`` (CUDA graphs).
-
-    This mirrors the body of the library's method (it has no way to run the axes concurrently),
-    so keep the two in step.
-    """
-    import mrcfile
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-    from torch_segment_tomogram_boundaries.utils import threeD
-
-    device = predictor.device
-    on_cuda = device.type == "cuda"
-
-    with mrcfile.open(tomogram, permissive=True) as mrc:
-        data = mrc.data.astype(np.float32)
-    original_shape = data.shape
-    logging.info("Input tomogram shape: %s", original_shape)
-
-    with torch.no_grad():
-        volume = threeD.resize_and_pad_3d(
-            torch.from_numpy(data), target_shape=predictor.target_shape_3d, mode="image"
-        ).to(device)
-        del data
-        if on_cuda:
-            torch.cuda.synchronize(device)  # the side streams must see the uploaded volume
-
-        def run_axis(axis: str, view: Any) -> Any:
-            if not on_cuda:
-                return predictor._predict_single_axis_with_slab_blending(
-                    view, axis, slab_size, batch_size
-                )
-            stream = torch.cuda.Stream(device)
-            with torch.cuda.stream(stream):
-                out = predictor._predict_single_axis_with_slab_blending(
-                    view, axis, slab_size, batch_size
-                )
-            stream.synchronize()
-            return out
-
-        logging.info("Predicting along the XZ and YZ axes at the same time.")
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="axis") as pool:
-            xz = pool.submit(run_axis, "XZ", volume)
-            yz = pool.submit(run_axis, "YZ", volume.permute(0, 2, 1))
-            pred_xz, pred_yz = xz.result(), yz.result().permute(0, 2, 1)
-        if on_cuda:  # made on side streams, used from now on on the current one
-            for pred in (pred_xz, pred_yz):
-                pred.record_stream(torch.cuda.current_stream(device))
-
-        logging.info("Averaging predictions from both axes.")
-        prob_map = (pred_xz + pred_yz) / 2.0
-        del pred_xz, pred_yz, volume
-
-        if smoothing_sigma and smoothing_sigma > 0:
-            logging.info("Applying 3D Gaussian smoothing with sigma=%s...", smoothing_sigma)
-            prob_map = threeD.gpu_gaussian_blur_3d(prob_map, smoothing_sigma, device)
-
-        logging.info("Resizing prediction back to original shape %s...", original_shape)
-        return (
-            F.interpolate(prob_map[None, None], size=original_shape, mode="area")
-            .squeeze()
-            .cpu()
-            .numpy()
-        )
 
 
 def _process_tomogram(
@@ -394,9 +320,9 @@ def _process_tomogram(
 
         paths = output_paths(tomogram, opts)
         logging.info("%s: predicting on %s", tomogram.name, device)
-        predict = _predict_axes_in_parallel if opts.parallel_axes else _predict_probabilities
-        probs = predict(
-            predictor, tomogram, opts.slab_size, opts.batch_size, opts.smoothing_sigma
+        probs = _predict_probabilities(
+            predictor, tomogram, opts.slab_size, opts.batch_size, opts.smoothing_sigma,
+            opts.parallel_axes,
         )
         with mrcfile.open(tomogram, permissive=True, header_only=True) as src:
             voxel_size = src.voxel_size.copy()

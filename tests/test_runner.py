@@ -323,17 +323,18 @@ def test_progress_view_rows_fit_the_terminal(monkeypatch, width):
 # ------------------------------------------------------------------ concurrent XZ/YZ passes
 
 
-def test_parallel_axes_gives_the_same_probabilities_as_the_library(
+def test_predict_probabilities_passes_parallel_axes_through_to_the_library(
     tmp_path, tiny_checkpoint, make_tomogram
 ):
+    """tomo-slab no longer implements concurrent axes itself; it just forwards the flag."""
     from torch_segment_tomogram_boundaries.predict import TomoSlabPredictor
 
     tomo = make_tomogram("t.mrc")
     predictor = TomoSlabPredictor(tiny_checkpoint, compile_model=False, device="cpu")
-    serial = predictor.predict_probabilities(tomo, slab_size=3, batch_size=4)
-    parallel = runner._predict_axes_in_parallel(predictor, tomo, 3, 4, None)
+    serial = runner._predict_probabilities(predictor, tomo, 3, 4, None, False)
+    parallel = runner._predict_probabilities(predictor, tomo, 3, 4, None, True)
     np.testing.assert_allclose(parallel, serial, atol=1e-5)
-    smoothed = runner._predict_axes_in_parallel(predictor, tomo, 3, 4, 1.0)
+    smoothed = runner._predict_probabilities(predictor, tomo, 3, 4, 1.0, True)
     assert smoothed.shape == serial.shape
 
 

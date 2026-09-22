@@ -5831,7 +5831,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "rich" },
-    { name = "torch-tomo-slab", git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries?tag=v0.1.0" },
+    { name = "torch-tomo-slab", git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries?tag=v0.2.0" },
     { name = "typer" },
 ]
 
@@ -5961,8 +5961,8 @@ wheels = [
 
 [[package]]
 name = "torch-tomo-slab"
-version = "0.1.0"
-source = { git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries?tag=v0.1.0#430c347f02c6456040b188e0af46d1a4d03aa646" }
+version = "0.2.0"
+source = { git = "https://github.com/teamtomo/torch-segment-tomogram-boundaries?tag=v0.2.0#fd44d0ddede36fcc80875ccb07d3cb1df850a7da" }
 dependencies = [
     { name = "albumentations" },
     { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
