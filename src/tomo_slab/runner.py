@@ -128,7 +128,6 @@ class PredictOptions:
     smoothing_sigma: Optional[float] = None
     save_probabilities: bool = False
     downsample_grid_size: int = 8
-    measure_thickness: bool = False
     parallel_axes: bool = False
 
 
@@ -348,11 +347,10 @@ def _process_tomogram(
         write("mask", final_mask)
         result.mask_path = paths["mask"]
 
-        if opts.measure_thickness:
-            result.thickness_row = {
-                "name": tomogram.name,
-                **measure_thickness(binary, float(voxel_size.x), planes=planes),
-            }
+        result.thickness_row = {
+            "name": tomogram.name,
+            **measure_thickness(binary, float(voxel_size.x), planes=planes),
+        }
         if opts.save_probabilities:
             write("probabilities", probs)
     except Exception as e:  # noqa: BLE001 - one bad tomogram must not stop the others
