@@ -59,6 +59,17 @@ def test_predict_rejects_bad_device(make_tomogram):
     assert result.exit_code != 0
 
 
+def test_predict_rejects_tomograms_that_collide_after_stripping_apix_tag(make_tomogram):
+    a = make_tomogram("sample_5.80Apx.mrc")
+    b = make_tomogram("sample_10.00Apx.mrc")
+    result = runner.invoke(app, ["predict", str(a), str(b), "--devices", "cpu"])
+    assert result.exit_code != 0
+    # Rich wraps long paths across lines in the terminal panel with "|" borders, so strip
+    # those and normalize whitespace before checking for the message.
+    flat = " ".join(result.output.replace("│", " ").split())
+    assert "would write the same output files" in flat
+
+
 def test_fit_planes_roundtrip(tmp_path):
     mask = np.zeros((64, 128, 128), np.float32)
     mask[20:44] = 1
