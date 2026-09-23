@@ -9,9 +9,41 @@ from typer.testing import CliRunner
 from tiny import apply_tiny_settings, use_fake_predictor
 from tomo_slab import runner
 from tomo_slab.cli import app
-from tomo_slab.runner import PredictOptions, assign_devices, parse_devices, run_predictions
+from tomo_slab.runner import (
+    PredictOptions,
+    assign_devices,
+    output_paths,
+    parse_devices,
+    run_predictions,
+    strip_apix_tag,
+)
 
 cli = CliRunner()
+
+
+# ------------------------------------------------------------------ output naming
+
+
+@pytest.mark.parametrize(
+    "stem, expected",
+    [
+        ("tomogram_5.80Apx", "tomogram"),
+        ("tomogram_10.00Apx", "tomogram"),
+        ("tomogram_5.80Apx_bin4", "tomogram_bin4"),
+        ("5.80Apx_tomogram", "tomogram"),
+        ("tomogram-10.00apx-bin2", "tomogram-bin2"),
+        ("plain_tomogram", "plain_tomogram"),
+    ],
+)
+def test_strip_apix_tag(stem, expected):
+    assert strip_apix_tag(stem) == expected
+
+
+def test_output_paths_strips_apix_tag_from_the_mask_name(tmp_path):
+    tomogram = tmp_path / "sample_5.80Apx.mrc"
+    paths = output_paths(tomogram, PredictOptions(output_dir=tmp_path, save_probabilities=True))
+    assert paths["mask"] == tmp_path / "sample_mask.mrc"
+    assert paths["probabilities"] == tmp_path / "sample_probabilities.mrc"
 
 
 # ------------------------------------------------------------------ device assignment
@@ -208,8 +240,15 @@ def test_predict_logs_to_file_and_keeps_the_console_quiet(
 ):
     shape = (96, 128, 128)
     tomos = [make_tomogram(f"t{i}.mrc", shape=shape) for i in range(2)]
+    ckpt = tmp_path / "unused.ckpt"
+    ckpt.write_bytes(b"")
     for devices in ("cpu", "cpu,cpu"):  # in-process, then worker processes
-        result, out, _ = _run_cli(tmp_path, tomos, devices)
+        out = tmp_path / f"out_{devices.replace(',', '_')}"
+        result = cli.invoke(
+            app,
+            ["--verbose", "INFO", "predict", *map(str, tomos), "-c", str(ckpt), "-o", str(out),
+             "--devices", devices],
+        )
         assert result.exit_code == 0, result.output
         log = (out / "tomo-slab.log").read_text()
         for t in tomos:
@@ -223,8 +262,15 @@ def test_predict_logs_to_file_and_keeps_the_console_quiet(
 
 def test_predict_log_file_option(tmp_path, make_tomogram, fake_predictor):
     tomo = make_tomogram("t.mrc", shape=(96, 128, 128))
+    ckpt = tmp_path / "unused.ckpt"
+    ckpt.write_bytes(b"")
     log = tmp_path / "custom" / "my.log"
-    result, out, _ = _run_cli(tmp_path, [tomo], "cpu", "--log-file", str(log))
+    out = tmp_path / "out"
+    result = cli.invoke(
+        app,
+        ["--verbose", "INFO", "predict", str(tomo), "-c", str(ckpt), "-o", str(out),
+         "--devices", "cpu", "--log-file", str(log)],
+    )
     assert result.exit_code == 0, result.output
     assert "fake predict t.mrc" in log.read_text()
     assert not (out / "tomo-slab.log").exists()

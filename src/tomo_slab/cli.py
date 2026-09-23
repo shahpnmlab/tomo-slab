@@ -32,6 +32,11 @@ class Accelerator(str, Enum):
     mps = "mps"
 
 
+class LogLevel(str, Enum):
+    info = "INFO"
+    debug = "DEBUG"
+
+
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"tomo-slab {__version__}")
@@ -48,12 +53,16 @@ def main(
         is_eager=True,
         help="Show the version and exit.",
     ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+    verbose: Optional[LogLevel] = typer.Option(
+        None, "--verbose", "-v",
+        help="Show INFO or DEBUG level logs (default: warnings and errors only).",
+    ),
 ) -> None:
     """Segment slab boundaries in tomographic volumes."""
+    level = verbose.value if verbose else None
     # Must happen before the library is imported: it calls logging.basicConfig() at import.
-    configure_logging(verbose)
-    ctx.meta["tomo_slab.verbose"] = verbose
+    configure_logging(level)
+    ctx.meta["tomo_slab.verbose"] = level
 
 
 def _ascii_histogram(values: list[float], unit: str, bins: int = 10, width: int = 40) -> str:
@@ -251,6 +260,7 @@ def predict(
         output_paths,
         parse_devices,
         run_predictions,
+        strip_apix_tag,
         validate_devices,
         worker_devices,
     )
@@ -275,12 +285,13 @@ def predict(
 
     stems: dict[str, Path] = {}
     for tomo in tomograms:
-        if tomo.stem in stems and stems[tomo.stem] != tomo:
+        key = strip_apix_tag(tomo.stem)
+        if key in stems and stems[key] != tomo:
             raise typer.BadParameter(
-                f"{stems[tomo.stem]} and {tomo} would write the same output files",
+                f"{stems[key]} and {tomo} would write the same output files",
                 param_hint="TOMOGRAMS...",
             )
-        stems[tomo.stem] = tomo
+        stems[key] = tomo
     tomograms = list(stems.values())
 
     opts = PredictOptions(
@@ -309,7 +320,7 @@ def predict(
         return
 
     # Log messages go to a file so that they do not garble the progress bars.
-    verbose = bool(ctx.meta.get("tomo_slab.verbose", False))
+    verbose = ctx.meta.get("tomo_slab.verbose")
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_file or output_dir / "tomo-slab.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)

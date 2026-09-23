@@ -12,6 +12,7 @@ import gc
 import logging
 import multiprocessing
 import queue
+import re
 import threading
 import traceback
 from collections.abc import Iterator, Sequence
@@ -23,23 +24,39 @@ from typing import Any, Callable, Optional
 
 LOG_FORMAT = "%(asctime)s - %(processName)s - %(levelname)s - %(message)s"
 
+# A pixel-size tag such as "5.80Apx" or "10.00Apx", optionally preceded by a separator.
+_APIX_TAG_RE = re.compile(r"[_.-]?\d{1,2}\.\d{1,2}[Aa]px")
 
-def configure_logging(verbose: bool, log_file: Optional[Path] = None) -> None:
+
+def strip_apix_tag(stem: str) -> str:
+    """Drop a pixel-size tag like ``5.80Apx`` or ``10.00Apx`` from a tomogram stem.
+
+    Also collapses any run of separators left behind (e.g. ``a__b`` -> ``a_b``) and trims
+    leading/trailing ones, so output filenames stay clean regardless of where the tag sat.
+    """
+    cleaned = _APIX_TAG_RE.sub("", stem)
+    cleaned = re.sub(r"[_.-]{2,}", "_", cleaned).strip("_.-")
+    return cleaned or stem
+
+
+def configure_logging(level: Optional[str], log_file: Optional[Path] = None) -> None:
     """Set up root logging: to the console, or to ``log_file`` only if one is given.
 
-    With a log file the console stays quiet (the CLI draws progress bars there) and Python
-    warnings are routed into the log as well. The library calls ``logging.basicConfig`` at
-    import time, which is a no-op once the root logger has a handler, so this must run before
-    the library is imported (in the CLI and in every worker).
+    ``level`` is ``"INFO"``, ``"DEBUG"``, or ``None`` for the default, which shows only
+    warnings and errors (the library logs a line of INFO detail per plane-fitting step, which
+    floods the console otherwise). With a log file the console stays quiet (the CLI draws
+    progress bars there) and Python warnings are routed into the log as well. The library
+    calls ``logging.basicConfig`` at import time, which is a no-op once the root logger has a
+    handler, so this must run before the library is imported (in the CLI and in every worker).
     """
-    level = logging.DEBUG if verbose else logging.INFO
+    level_no = getattr(logging, level) if level else logging.WARNING
     if log_file is None:
-        logging.basicConfig(level=level, format=LOG_FORMAT, force=True)
+        logging.basicConfig(level=level_no, format=LOG_FORMAT, force=True)
         return
     # Every process appends to the same file; one short line per write keeps them intact.
     handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    logging.basicConfig(level=level, handlers=[handler], force=True)
+    logging.basicConfig(level=level_no, handlers=[handler], force=True)
     logging.captureWarnings(False)  # captureWarnings(True) is a no-op if already on; reset first
     logging.captureWarnings(True)
 
@@ -151,7 +168,7 @@ class TomogramResult:
 
 def output_paths(tomogram: Path, opts: PredictOptions) -> dict[str, Path]:
     """Output files that ``opts`` asks for, for one tomogram."""
-    stem = tomogram.stem
+    stem = strip_apix_tag(tomogram.stem)
     paths = {"mask": opts.output_dir / f"{stem}_mask.mrc"}
     if opts.save_probabilities:
         paths["probabilities"] = opts.output_dir / f"{stem}_probabilities.mrc"
@@ -391,7 +408,7 @@ def _init_worker(
     progress_queue: Any,
     checkpoint: Path,
     compile_model: bool,
-    verbose: bool,
+    verbose: Optional[str],
     log_file: Optional[Path],
     worker_setup: Optional[Callable[[], None]],
 ) -> None:
@@ -452,7 +469,7 @@ def run_predictions(
     opts: PredictOptions,
     checkpoint: Path,
     compile_model: bool = False,
-    verbose: bool = False,
+    verbose: Optional[str] = None,
     log_file: Optional[Path] = None,
     on_progress: Optional[Callable[[ProgressEvent], None]] = None,
     worker_setup: Optional[Callable[[], None]] = None,
