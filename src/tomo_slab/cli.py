@@ -75,18 +75,20 @@ def _report_thickness(rows: list[dict], output: Optional[Path]) -> None:
     """Print a thickness histogram to screen and optionally write the raw rows to a CSV file."""
     from torch_segment_tomogram_boundaries.measure import write_thickness_csv
 
+    typer.echo("Calculating thickness...")
     failed = [r for r in rows if r["mean_vox"] != r["mean_vox"]]  # NaN -> empty mask
     ok = [r for r in rows if r["mean_vox"] == r["mean_vox"]]
-    for r in failed:
-        typer.secho(
-            f"{r['name']}: could not measure thickness (mask empty or too small to fit planes)",
-            fg=typer.colors.YELLOW,
-        )
     if ok:
         has_nm = all(r["voxel_size_A"] == r["voxel_size_A"] for r in ok)
         unit = "nm" if has_nm else "vox"
         values = [r["mean_nm"] if has_nm else r["mean_vox"] for r in ok]
         typer.echo(_ascii_histogram(values, unit))
+    if failed:
+        typer.secho(
+            f"{len(failed)} of {len(rows)} mask(s) too small/empty to measure thickness: "
+            + ", ".join(r["name"] for r in failed),
+            fg=typer.colors.YELLOW,
+        )
     if output is not None and rows:
         write_thickness_csv(rows, output)
         typer.echo(f"Thickness table written to {output}")
@@ -206,7 +208,8 @@ def predict(
     ),
     thickness_file: Optional[Path] = typer.Option(
         None, "--thickness-file", dir_okay=False,
-        help="Measure slab thickness and write it for all tomograms to this CSV file.",
+        help="Also write per-tomogram thickness measurements to this CSV file "
+        "(a summary histogram is always printed).",
     ),
     devices: Optional[str] = typer.Option(
         None, "--devices", metavar="DEVICES",
@@ -288,7 +291,6 @@ def predict(
         smoothing_sigma=smoothing_sigma,
         save_probabilities=save_probabilities,
         downsample_grid_size=downsample_grid_size,
-        measure_thickness=thickness_file is not None,
         parallel_axes=parallel_axes,
     )
 
@@ -356,7 +358,7 @@ def predict(
                 if verbose and result.traceback:
                     view.print(result.traceback, err=True)
 
-    if thickness_file is not None:
+    if thickness_rows:
         # Completion order is arbitrary; report in input order.
         _report_thickness([row for _, row in sorted(thickness_rows, key=lambda x: x[0])],
                           thickness_file)
