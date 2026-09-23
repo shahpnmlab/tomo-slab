@@ -138,7 +138,7 @@ def _run_cli(tmp_path, tomos, devices, *extra):
     ckpt.write_bytes(b"")
     result = cli.invoke(
         app,
-        ["predict", *map(str, tomos), "-c", str(ckpt), "-o", str(out), "--fit-planes",
+        ["predict", *map(str, tomos), "-c", str(ckpt), "-o", str(out),
          "--thickness-file", str(csv_path), "--devices", devices, *extra],
     )
     return result, out, csv_path
@@ -155,7 +155,6 @@ def test_cli_predict_two_cpu_workers(tmp_path, make_tomogram, fake_predictor):
     assert result.exit_code == 0, result.output
     for t in tomos:
         assert (out / f"{t.stem}_mask.mrc").exists()
-        assert (out / f"{t.stem}_fitted_mask.mrc").exists()
     rows = _rows(csv_path)
     assert [r["name"] for r in rows] == [t.name for t in tomos]  # input order
     for r in rows:
@@ -168,11 +167,10 @@ def test_cli_multi_worker_matches_single_process(tmp_path, make_tomogram, fake_p
     r2, out2, csv2 = _run_cli(tmp_path, tomos, "cpu,cpu", "--jobs-per-device", "2")
     assert r1.exit_code == 0 and r2.exit_code == 0, (r1.output, r2.output)
     for t in tomos:
-        for suffix in ("mask", "fitted_mask"):
-            with mrcfile.open(out1 / f"{t.stem}_{suffix}.mrc") as a, mrcfile.open(
-                out2 / f"{t.stem}_{suffix}.mrc"
-            ) as b:
-                np.testing.assert_array_equal(a.data, b.data)
+        with mrcfile.open(out1 / f"{t.stem}_mask.mrc") as a, mrcfile.open(
+            out2 / f"{t.stem}_mask.mrc"
+        ) as b:
+            np.testing.assert_array_equal(a.data, b.data)
     assert _rows(csv1) == _rows(csv2)
 
 
@@ -236,7 +234,7 @@ def test_run_predictions_reports_progress_from_workers(tmp_path, make_tomogram, 
     from tomo_slab.runner import ProgressEvent
 
     tomos = [make_tomogram(f"t{i}.mrc", shape=(96, 128, 128)) for i in range(3)]
-    opts = PredictOptions(output_dir=tmp_path, fit_planes=True)
+    opts = PredictOptions(output_dir=tmp_path)
     events = []
     results = list(
         run_predictions(

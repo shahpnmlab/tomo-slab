@@ -127,7 +127,6 @@ class PredictOptions:
     batch_size: int = 16
     smoothing_sigma: Optional[float] = None
     save_probabilities: bool = False
-    fit_planes: bool = False
     downsample_grid_size: int = 8
     measure_thickness: bool = False
     parallel_axes: bool = False
@@ -157,8 +156,6 @@ def output_paths(tomogram: Path, opts: PredictOptions) -> dict[str, Path]:
     paths = {"mask": opts.output_dir / f"{stem}_mask.mrc"}
     if opts.save_probabilities:
         paths["probabilities"] = opts.output_dir / f"{stem}_probabilities.mrc"
-    if opts.fit_planes:
-        paths["fitted_mask"] = opts.output_dir / f"{stem}_fitted_mask.mrc"
     return paths
 
 
@@ -296,7 +293,7 @@ def _process_tomogram(
     report: Optional[Callable[[ProgressEvent], None]] = None,
     slot: int = 0,
 ) -> TomogramResult:
-    """Predict -> threshold -> write mask -> (fit planes once) -> write outputs -> thickness.
+    """Predict -> threshold -> fit planes -> write mask (fallback: thresholded) -> thickness.
 
     Never raises for a per-tomogram problem; the failure is recorded in the result and any
     files already written for this tomogram are removed.
@@ -334,28 +331,28 @@ def _process_tomogram(
             )
             written.append(paths[key])
 
+        # Fit the top/bottom planes once; reuse them for the mask itself and for thickness.
+        _emit("update", "fitting planes")
+        planes = None
+        final_mask = binary
+        try:
+            planes = fit_slab_planes(
+                binary.astype(np.uint8), opts.downsample_grid_size, device=device
+            )
+            final_mask = generate_mask_from_planes(planes, binary.shape)
+        except (ValueError, RuntimeError) as e:
+            result.warnings.append(f"plane fitting failed ({e}); saved thresholded mask instead")
+            logging.warning("%s: plane fitting failed (%s)", tomogram.name, e)
+
         _emit("update", "writing mask")
-        write("mask", binary)
+        write("mask", final_mask)
         result.mask_path = paths["mask"]
 
-        # Fit the top/bottom planes once; reuse them for the fitted mask and thickness.
-        planes = None
-        if opts.fit_planes or opts.measure_thickness:
-            _emit("update", "fitting planes")
-            try:
-                planes = fit_slab_planes(
-                    binary.astype(np.uint8), opts.downsample_grid_size, device=device
-                )
-            except (ValueError, RuntimeError) as e:
-                result.warnings.append(f"plane fitting failed ({e})")
-                logging.warning("%s: plane fitting failed (%s)", tomogram.name, e)
         if opts.measure_thickness:
             result.thickness_row = {
                 "name": tomogram.name,
                 **measure_thickness(binary, float(voxel_size.x), planes=planes),
             }
-        if opts.fit_planes and planes is not None:
-            write("fitted_mask", generate_mask_from_planes(planes, binary.shape))
         if opts.save_probabilities:
             write("probabilities", probs)
     except Exception as e:  # noqa: BLE001 - one bad tomogram must not stop the others
