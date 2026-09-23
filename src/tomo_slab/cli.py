@@ -56,26 +56,37 @@ def main(
     ctx.meta["tomo_slab.verbose"] = verbose
 
 
+def _ascii_histogram(values: list[float], unit: str, bins: int = 10, width: int = 40) -> str:
+    """Render ``values`` as a horizontal ASCII histogram binned over their range."""
+    import numpy as np
+
+    lo, hi = min(values), max(values)
+    edges = np.array([lo, lo + 1.0]) if lo == hi else np.linspace(lo, hi, bins + 1)
+    counts, edges = np.histogram(values, bins=edges)
+    max_count = counts.max() or 1
+    lines = [f"Mean thickness across {len(values)} tomogram(s) ({unit}):"]
+    for i, count in enumerate(counts):
+        bar = "#" * int(round(width * count / max_count))
+        lines.append(f"  [{edges[i]:7.2f}, {edges[i + 1]:7.2f}) | {bar} {count}")
+    return "\n".join(lines)
+
+
 def _report_thickness(rows: list[dict], output: Optional[Path]) -> None:
-    """Print thickness rows to screen and optionally write them to a CSV file."""
+    """Print a thickness histogram to screen and optionally write the raw rows to a CSV file."""
     from torch_segment_tomogram_boundaries.measure import write_thickness_csv
 
-    for r in rows:
-        if r["mean_vox"] != r["mean_vox"]:  # NaN -> empty mask
-            typer.secho(
-                f"{r['name']}: could not measure thickness (mask empty or too small to fit planes)",
-                fg=typer.colors.YELLOW,
-            )
-            continue
-        msg = (
-            f"{r['name']}: thickness {r['median_vox']:.1f} vox "
-            f"(mean {r['mean_vox']:.1f} +/- {r['std_vox']:.1f})"
+    failed = [r for r in rows if r["mean_vox"] != r["mean_vox"]]  # NaN -> empty mask
+    ok = [r for r in rows if r["mean_vox"] == r["mean_vox"]]
+    for r in failed:
+        typer.secho(
+            f"{r['name']}: could not measure thickness (mask empty or too small to fit planes)",
+            fg=typer.colors.YELLOW,
         )
-        if r["voxel_size_A"] == r["voxel_size_A"]:
-            msg += f" = {r['median_nm']:.1f} nm (mean {r['mean_nm']:.1f} +/- {r['std_nm']:.1f} nm)"
-        else:
-            msg += " [no voxel size in header; nm not reported]"
-        typer.echo(msg)
+    if ok:
+        has_nm = all(r["voxel_size_A"] == r["voxel_size_A"] for r in ok)
+        unit = "nm" if has_nm else "vox"
+        values = [r["mean_nm"] if has_nm else r["mean_vox"] for r in ok]
+        typer.echo(_ascii_histogram(values, unit))
     if output is not None and rows:
         write_thickness_csv(rows, output)
         typer.echo(f"Thickness table written to {output}")
@@ -189,12 +200,9 @@ def predict(
         False, "--compile/--no-compile", help="Use torch.compile (slower start, faster inference)."
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing outputs."),
-    fit_planes_mask: bool = typer.Option(
-        False, "--fit-planes", help="Also write the plane-fitted mask (<stem>_fitted_mask.mrc)."
-    ),
     downsample_grid_size: int = typer.Option(
         8, "--downsample-grid-size", min=1,
-        help="Surface-point downsampling grid for plane fitting.",
+        help="Surface-point downsampling grid used when fitting the mask's top/bottom planes.",
     ),
     thickness_file: Optional[Path] = typer.Option(
         None, "--thickness-file", dir_okay=False,
@@ -223,9 +231,14 @@ def predict(
         "Default: <output-dir>/tomo-slab.log.",
     ),
 ) -> None:
-    """Predict slab masks for one or more tomograms, optionally fitting planes and measuring thickness.
+    """Predict slab masks for one or more tomograms, optionally measuring thickness.
 
-    One tomogram is one unit of work, and there are one worker process per device per --jobs-per-device (a single worker runs in-process). A tomogram that fails is reported and skipped; the exit code is non-zero if any failed.
+    The mask is produced by thresholding the prediction and then fitting planes to its top
+    and bottom surfaces, so void regions are cleanly separated from signal; if plane fitting
+    fails (e.g. too few boundary points) the raw thresholded mask is saved instead, with a
+    warning. One tomogram is one unit of work, and there are one worker process per device per
+    --jobs-per-device (a single worker runs in-process). A tomogram that fails is reported and
+    skipped; the exit code is non-zero if any failed.
     """  # noqa: E501
     from tomo_slab.progress import ProgressView
     from tomo_slab.runner import (
@@ -274,7 +287,6 @@ def predict(
         batch_size=batch_size,
         smoothing_sigma=smoothing_sigma,
         save_probabilities=save_probabilities,
-        fit_planes=fit_planes_mask,
         downsample_grid_size=downsample_grid_size,
         measure_thickness=thickness_file is not None,
         parallel_axes=parallel_axes,
